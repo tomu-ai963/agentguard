@@ -7,6 +7,7 @@ $GUARD_URL       = "https://agentguard.inverted-triangle-leef.workers.dev"
 $AGENT_ID        = "claude-code-local"
 $POLL_INTERVAL   = 5   # seconds
 $POLL_TIMEOUT    = 60  # seconds
+$HEARTBEAT_EVERY = 30  # seconds between background heartbeats
 
 # Commands that must pass through AgentGuard (regex → tool name)
 $GUARDED_COMMANDS = [ordered]@{
@@ -15,6 +16,61 @@ $GUARDED_COMMANDS = [ordered]@{
     'git\s+push'                  = 'git_push'
     'rm\s+.*-[rR][fF]'           = 'rm_rf'
     'Remove-Item\b.*-Recurse'     = 'remove_item_recurse'
+}
+
+# #1: session-local metrics the wrapper is actually able to observe.
+# loopCount tracks repeated invocations of the *same* guarded tool in a row
+# (the pattern the loop-guard/loop-warn rules are meant to catch).
+# costUSD/tokensUsed are populated only if the calling agent sets them via
+# Set-GuardCost before invoking Invoke-Guarded — AgentGuard has no visibility
+# into token spend on its own, so this remains the caller's responsibility,
+# but it is now actually wired through instead of silently discarded.
+$script:GuardMetrics = @{
+    lastTool    = $null
+    loopCount   = 0
+    costUSD     = 0.0
+    tokensUsed  = 0
+}
+$script:LastHeartbeatAt = [DateTime]::MinValue
+
+function Set-GuardCost {
+    param([double]$CostUSD, [int]$TokensUsed)
+    if ($PSBoundParameters.ContainsKey('CostUSD'))    { $script:GuardMetrics.costUSD    = $CostUSD }
+    if ($PSBoundParameters.ContainsKey('TokensUsed'))  { $script:GuardMetrics.tokensUsed = $TokensUsed }
+}
+
+function Update-GuardLoopCount {
+    param([string]$ToolName)
+    if ($script:GuardMetrics.lastTool -eq $ToolName) {
+        $script:GuardMetrics.loopCount++
+    } else {
+        $script:GuardMetrics.loopCount = 1
+        $script:GuardMetrics.lastTool  = $ToolName
+    }
+}
+
+function Send-GuardHeartbeat {
+    param([switch]$Force)
+
+    $elapsed = ([DateTime]::UtcNow - $script:LastHeartbeatAt).TotalSeconds
+    if (-not $Force -and $elapsed -lt $HEARTBEAT_EVERY) { return }
+
+    $body = @{
+        agentId = $AGENT_ID
+        metrics = @{
+            loopCount  = $script:GuardMetrics.loopCount
+            costUSD    = $script:GuardMetrics.costUSD
+            tokensUsed = $script:GuardMetrics.tokensUsed
+        }
+    } | ConvertTo-Json -Compress
+
+    try {
+        Invoke-RestMethod -Uri "$GUARD_URL/heartbeat" -Method POST `
+            -ContentType "application/json" -Body $body -ErrorAction Stop | Out-Null
+        $script:LastHeartbeatAt = [DateTime]::UtcNow
+    } catch {
+        Write-Warning "[AgentGuard] /heartbeat failed: $($_.Exception.Message)"
+    }
 }
 
 function Get-GuardedTool {
@@ -33,7 +89,11 @@ function Invoke-GuardCheck {
         action  = $ToolName
         tool    = $ToolName
         params  = @{ cmd = $Cmd }
-        metrics = @{}
+        metrics = @{
+            loopCount  = $script:GuardMetrics.loopCount
+            costUSD    = $script:GuardMetrics.costUSD
+            tokensUsed = $script:GuardMetrics.tokensUsed
+        }
     } | ConvertTo-Json -Compress
 
     try {
@@ -76,6 +136,12 @@ function Invoke-Guarded {
         Invoke-Expression $Command
         return
     }
+
+    # #1: update the local loop counter *before* checking, so a rapid
+    # succession of the same guarded tool actually trips loop-warn/loop-guard
+    # instead of always reporting loopCount=0.
+    Update-GuardLoopCount -ToolName $toolName
+    Send-GuardHeartbeat
 
     Write-Host ""
     Write-Host "[AgentGuard] Intercepted : $Command"
