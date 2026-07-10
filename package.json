@@ -1,10 +1,10 @@
 {
   "name": "agentguard",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node test-engine.mjs",
+    "test": "node test-engine.mjs && node test-store.mjs && node test-check-handler.mjs",
     "dev": "wrangler dev"
   },
   "devDependencies": {

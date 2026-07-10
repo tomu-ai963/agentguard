@@ -12,7 +12,10 @@ const K = {
   rules: () => `rules:global`,
   approval: (rid) => `approval:${rid}`,
   killswitch: (id) => `killswitch:${id}`,
+  notifyCooldown: (agentId, ruleId) => `notified:${agentId}:${ruleId}`,
 };
+
+const NOTIFY_COOLDOWN_SECONDS = 600; // 10 minutes
 
 export async function getRules(env) {
   const raw = await env.GUARD_KV.get(K.rules());
@@ -38,6 +41,25 @@ export async function getState(env, agentId) {
 export async function setState(env, agentId, patch) {
   const cur = await getState(env, agentId);
   const next = { ...cur, ...patch, agentId };
+  await env.GUARD_KV.put(K.state(agentId), JSON.stringify(next));
+  return next;
+}
+
+// Server-observed counters: independent from anything the caller self-reports.
+// Called once per /check regardless of what the agent claims about itself.
+export async function incrementCheckCounters(env, agentId) {
+  const cur = await getState(env, agentId);
+  const now = Date.now();
+  const windowStart = cur.rateWindowStart ?? now;
+  const withinWindow = now - windowStart < 60_000;
+
+  const next = {
+    ...cur,
+    agentId,
+    checkCount: (cur.checkCount ?? 0) + 1,
+    rateWindowStart: withinWindow ? windowStart : now,
+    apiCallsInWindow: (withinWindow ? (cur.apiCallsInWindow ?? 0) : 0) + 1,
+  };
   await env.GUARD_KV.put(K.state(agentId), JSON.stringify(next));
   return next;
 }
@@ -85,4 +107,18 @@ export async function resolveApproval(env, rid, status) {
   rec.resolvedAt = Date.now();
   await env.GUARD_KV.put(K.approval(rid), JSON.stringify(rec), { expirationTtl: 3600 });
   return rec;
+}
+
+// Notification cooldown: prevents a sustained stop/pause verdict from
+// spamming the notify channel on every /check retry loop.
+// Returns true if a notification is allowed to be sent right now, and
+// atomically marks the cooldown as started (best-effort; KV has no CAS,
+// so a rare double-send under high concurrency is an acceptable tradeoff
+// vs. the alternative of a silent notify channel).
+export async function shouldNotify(env, agentId, ruleId) {
+  const key = K.notifyCooldown(agentId, ruleId);
+  const existing = await env.GUARD_KV.get(key);
+  if (existing) return false;
+  await env.GUARD_KV.put(key, "1", { expirationTtl: NOTIFY_COOLDOWN_SECONDS });
+  return true;
 }

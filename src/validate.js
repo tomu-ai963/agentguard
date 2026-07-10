@@ -11,10 +11,12 @@ const RULE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Only these metric keys are ever accepted from the network. Everything else
-// (lastHeartbeat, status, killswitch, ...) is server-derived and must not be
-// spoofable via /heartbeat or /check.
+// (lastHeartbeat, status, killswitch, apiCallsPerMin, ...) is server-derived
+// and must not be spoofable via /heartbeat or /check. In particular
+// apiCallsPerMin is computed from server-observed check counters
+// (incrementCheckCounters) — a self-reported value would defeat the point.
 const NUMERIC_METRICS = [
-  "loopCount", "tokensUsed", "costUSD", "apiCallsPerMin", "tokenBurnRate",
+  "loopCount", "tokensUsed", "costUSD", "tokenBurnRate",
 ];
 
 // Audit-log entries are consumed downstream (JSONL -> detchi -> pgvector),

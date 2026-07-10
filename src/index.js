@@ -16,6 +16,9 @@
 // [admin] routes accept only ADMIN_TOKEN. Comparison is constant-time and
 // repeated failures lock the source IP out (see auth.js). Routes fail closed
 // (503) until both secrets are set.
+//
+// /check side effects (state persist, audit log, notify) are deferred via
+// executionCtx.waitUntil so they never delay or fail the judge response.
 
 import { judge } from "./engine.js";
 import { notify } from "./notifier/index.js";
@@ -28,6 +31,7 @@ import {
   getRules, setRules, getState, setState, appendLog,
   isKillswitchActive, setKillswitch,
   createApproval, getApproval, resolveApproval,
+  incrementCheckCounters, shouldNotify,
 } from "./store.js";
 
 const json = (obj, status = 200) =>
@@ -51,6 +55,14 @@ function levelFromVerdict(v) {
   return v === "stop" ? "stop" : v === "pause" ? "pause" : v === "throttle" ? "warn" : "info";
 }
 
+// Runs `fn` as a deferred side effect via the Workers executionCtx.waitUntil,
+// so it never delays or fails the response. Falls back to fire-and-forget
+// if executionCtx isn't available (e.g. some local test harnesses).
+function deferred(executionCtx, fn) {
+  const p = Promise.resolve().then(fn);
+  if (executionCtx?.waitUntil) executionCtx.waitUntil(p);
+}
+
 // Send a notification and record delivery failures in the audit trail so a
 // missed pause/stop alert never fails silently.
 async function notifyAndAudit(env, agentId, payload) {
@@ -66,14 +78,14 @@ async function notifyAndAudit(env, agentId, payload) {
 }
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, executionCtx) {
     const url = new URL(req.url);
     const { pathname } = url;
     const method = req.method;
 
     try {
       if (method === "GET" && pathname === "/") {
-        return json({ service: "AgentGuard", version: "0.2.0" });
+        return json({ service: "AgentGuard", version: "0.3.0" });
       }
 
       // ---- auth gate: everything below requires a token ----
@@ -97,24 +109,35 @@ export default {
         const params = ctx.params && typeof ctx.params === "object" ? ctx.params : {};
         const supplied = sanitizeMetrics(ctx.metrics);
 
+        // #5: independent KV reads run in parallel instead of serially.
+        // #2: server-observed counters are incremented unconditionally,
+        // in the same parallel batch — the caller cannot skip this by
+        // omitting metrics.
+        const [state, ksActive, rules, observed] = await Promise.all([
+          getState(env, agentId),
+          isKillswitchActive(env, agentId),
+          getRules(env),
+          incrementCheckCounters(env, agentId),
+        ]);
+        const now = Date.now();
+
         // Enrich metrics with derived facts the engine understands.
         // Spend counters are monotonic: an agent (or whoever holds its token)
         // can never lower its own recorded cost to slip under a cap.
-        const state = await getState(env, agentId);
-        const ksActive = await isKillswitchActive(env, agentId);
-        const now = Date.now();
+        // apiCallsPerMin is always server-derived (sanitizeMetrics drops the
+        // self-reported field entirely) — it cannot be spoofed or omitted.
         const metrics = {
           ...supplied,
           loopCount: supplied.loopCount ?? state.loopCount ?? 0,
           costUSD: Math.max(supplied.costUSD ?? 0, state.costUSD ?? 0),
           tokensUsed: Math.max(supplied.tokensUsed ?? 0, state.tokensUsed ?? 0),
+          apiCallsPerMin: observed.apiCallsInWindow ?? 0,
           secondsSinceHeartbeat: state.lastHeartbeat
             ? Math.floor((now - state.lastHeartbeat) / 1000)
             : 0,
           killswitch: ksActive ? 1 : 0,
         };
 
-        const rules = await getRules(env);
         const result = judge(rules, { agentId, action, tool, params, metrics });
 
         // For pause verdicts, open an approval request the wrapper can poll.
@@ -127,18 +150,45 @@ export default {
           approvalId = appr.requestId;
         }
 
-        await appendLog(env, agentId, {
-          action, tool,
-          verdict: result.verdict, reason: result.reason, ruleId: result.ruleId,
-          source: "guard",
-        });
+        // #3: persist the (already-monotonic) cost/token/loop figures used
+        // for this judgement, so agents that only ever call /check (never
+        // /heartbeat) don't silently reset to costUSD=0 on every request.
+        // #5: persistence, audit log, and notification are side effects of
+        // an already-decided verdict — deferred via waitUntil so they never
+        // block or fail the judge response. Failures go to console.error
+        // (and, for notify, to the audit trail via notifyAndAudit).
+        deferred(executionCtx, () =>
+          setState(env, agentId, {
+            loopCount: metrics.loopCount,
+            costUSD: metrics.costUSD,
+            tokensUsed: metrics.tokensUsed,
+          }).catch((err) => console.error("state persist failed:", err))
+        );
+        deferred(executionCtx, () =>
+          appendLog(env, agentId, {
+            action, tool,
+            verdict: result.verdict, reason: result.reason, ruleId: result.ruleId,
+            source: "guard",
+          }).catch((err) => console.error("appendLog failed:", err))
+        );
 
-        if (result.notify) {
-          await notifyAndAudit(env, agentId, {
-            level: levelFromVerdict(result.verdict),
-            title: `AgentGuard: ${result.verdict.toUpperCase()}`,
-            message: result.reason,
-            agentId, action, verdict: result.verdict, approvalId,
+        if (result.notify && result.ruleId) {
+          // #4: cooldown gate — a sustained stop/pause verdict (e.g. an
+          // agent retrying in a loop while blocked) must not spam the
+          // notify channel on every single /check call.
+          deferred(executionCtx, async () => {
+            try {
+              const allowed = await shouldNotify(env, agentId, result.ruleId);
+              if (!allowed) return;
+              await notifyAndAudit(env, agentId, {
+                level: levelFromVerdict(result.verdict),
+                title: `AgentGuard: ${result.verdict.toUpperCase()}`,
+                message: result.reason,
+                agentId, action, verdict: result.verdict, approvalId,
+              });
+            } catch (err) {
+              console.error("notify dispatch failed:", err);
+            }
           });
         }
 
