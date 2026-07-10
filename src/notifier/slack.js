@@ -1,12 +1,13 @@
 // notifier/slack.js
-// v2 stub. Same shape as discord.js so notifier/index.js can register it with
-// one line. Fill in when a user actually needs Slack — no engine changes needed.
+// Slack incoming-webhook adapter. Registered in notifier/index.js; enable by
+// adding "slack" to NOTIFY_CHANNELS and setting the SLACK_WEBHOOK_URL secret.
 
 export async function send(payload, env) {
   const url = env.SLACK_WEBHOOK_URL;
   if (!url) {
-    console.error("SLACK_WEBHOOK_URL not set; skipping notification");
-    return;
+    // Throw so notifier/index.js counts this as a delivery failure instead
+    // of silently dropping the alert (e.g. channel enabled but secret unset).
+    throw new Error("SLACK_WEBHOOK_URL not set");
   }
   // Slack incoming-webhook payload. Block Kit buttons (approval) come in v2.
   const emoji = { stop: ":red_circle:", pause: ":large_orange_circle:",

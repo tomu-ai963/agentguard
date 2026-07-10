@@ -1,20 +1,33 @@
 # guard-wrapper.ps1
 # Usage:
+#   $env:AGENTGUARD_AGENT_TOKEN = "<AGENT_TOKEN>"   # or set machine-wide
 #   . .\guard-wrapper.ps1
 #   Invoke-Guarded "wrangler deploy"
 
 $GUARD_URL       = "https://agentguard.inverted-triangle-leef.workers.dev"
 $AGENT_ID        = "claude-code-local"
-$POLL_INTERVAL   = 5   # seconds
-$POLL_TIMEOUT    = 60  # seconds
+$AGENT_TOKEN     = $env:AGENTGUARD_AGENT_TOKEN
+$POLL_INTERVAL   = 5    # seconds
+$POLL_TIMEOUT    = 300  # seconds — long enough for a human to notice the ping
+
+if (-not $AGENT_TOKEN) {
+    Write-Warning "[AgentGuard] AGENTGUARD_AGENT_TOKEN is not set — guarded commands will be BLOCKED (the guard now requires auth)."
+}
+
+function Get-GuardHeaders {
+    if ($AGENT_TOKEN) { return @{ Authorization = "Bearer $AGENT_TOKEN" } }
+    return @{}
+}
 
 # Commands that must pass through AgentGuard (regex → tool name)
+# rm pattern: any rm whose options include r/R catches -rf, -fr, -r -f,
+# --recursive (over-matching pauses are acceptable; missing one is not).
 $GUARDED_COMMANDS = [ordered]@{
-    'wrangler\s+deploy'           = 'wrangler_deploy'
-    'npm\s+publish'               = 'npm_publish'
-    'git\s+push'                  = 'git_push'
-    'rm\s+.*-[rR][fF]'           = 'rm_rf'
-    'Remove-Item\b.*-Recurse'     = 'remove_item_recurse'
+    'wrangler(\.cmd|\.exe)?\s+deploy'  = 'wrangler_deploy'
+    'npm\s+publish'                    = 'npm_publish'
+    'git\s+push'                       = 'git_push'
+    'rm\s+(.*\s)?-{1,2}[^\s-]*[rR]'    = 'rm_rf'
+    'Remove-Item\b.*-Recurse'          = 'remove_item_recurse'
 }
 
 function Get-GuardedTool {
@@ -40,6 +53,7 @@ function Invoke-GuardCheck {
         return Invoke-RestMethod -Uri "$GUARD_URL/check" `
             -Method POST `
             -ContentType "application/json" `
+            -Headers (Get-GuardHeaders) `
             -Body $body `
             -ErrorAction Stop
     } catch {
@@ -57,9 +71,13 @@ function Wait-Approval {
         $elapsed += $POLL_INTERVAL
         try {
             $rec = Invoke-RestMethod -Uri "$GUARD_URL/approval/$ApprovalId" `
-                -Method GET -ErrorAction Stop
+                -Method GET -Headers (Get-GuardHeaders) -ErrorAction Stop
             if ($rec.status -in @("approved", "denied")) { return $rec.status }
         } catch {
+            # 404 = the approval expired server-side (1h TTL): stop polling.
+            if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
+                return "expired"
+            }
             Write-Warning "[AgentGuard] Polling error: $($_.Exception.Message)"
         }
         Write-Host "[AgentGuard] Still waiting... ($elapsed / $POLL_TIMEOUT s)"
@@ -137,6 +155,9 @@ function Invoke-Guarded {
                 }
                 "timeout" {
                     Write-Host "[AgentGuard] ✗ Approval timeout (${POLL_TIMEOUT}s) — command aborted."
+                }
+                "expired" {
+                    Write-Host "[AgentGuard] ✗ Approval expired server-side — command aborted."
                 }
             }
         }

@@ -13,8 +13,14 @@ id = "0b7e9cfd921e46c19bc431374a194f30"
 # --- Plain (non-secret) vars ---
 [vars]
 ENV_NAME = "dev"
+# Comma-separated notification channels; "slack" additionally needs the
+# SLACK_WEBHOOK_URL secret.
+NOTIFY_CHANNELS = "discord"
 
 # --- Secrets (do NOT put real values here) ---
-# Set at deploy time, not committed:
+# Set at deploy time, not committed. ADMIN_TOKEN and AGENT_TOKEN are both
+# REQUIRED — every route fails closed (503) until they exist:
 #   npx wrangler secret put DISCORD_WEBHOOK_URL
 #   npx wrangler secret put ADMIN_TOKEN
+#   npx wrangler secret put AGENT_TOKEN
+# For local dev, mirror them in .dev.vars (gitignored).

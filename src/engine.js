@@ -27,6 +27,10 @@
 
 const VERDICT_RANK = { allow: 0, throttle: 1, pause: 2, stop: 3 };
 
+// Cap the text fed to user-defined `matches` regexes so a pathological
+// pattern can't be driven into catastrophic backtracking by a huge payload.
+const MAX_PARAMS_TEXT = 10_000;
+
 const OPS = {
   ">":  (a, b) => Number(a) >  Number(b),
   ">=": (a, b) => Number(a) >= Number(b),
@@ -61,7 +65,7 @@ function buildFacts(ctx) {
     action: ctx.action ?? "",
     tool: ctx.tool ?? "",
     params: ctx.params ?? {},
-    paramsText: JSON.stringify(ctx.params ?? {}),
+    paramsText: JSON.stringify(ctx.params ?? {}).slice(0, MAX_PARAMS_TEXT),
   };
 }
 
@@ -75,10 +79,11 @@ function evalCondition(cond, facts) {
   const op = OPS[cond.op];
   if (!op) return false;
 
-  // metric leaf vs field leaf
+  // metric leaf vs field leaf. Own-property check only: `in` would also
+  // match inherited keys like "constructor" and compare against built-ins.
   const key = cond.metric ?? cond.field;
   if (key === undefined) return false;
-  const left = key === "paramsText" || key in facts ? facts[key] : undefined;
+  const left = Object.hasOwn(facts, key) ? facts[key] : undefined;
   return op(left, cond.value);
 }
 
@@ -104,6 +109,10 @@ export function judge(rules, ctx) {
         notify: rule.notify ?? rank >= VERDICT_RANK.pause, // pause/stop notify by default
         ruleId: rule.id,
       };
+    } else if (rank === best.rank && rank === VERDICT_RANK.throttle) {
+      // Several throttle rules matched: honor the longest requested wait
+      // instead of whichever rule happened to come first.
+      best.waitMs = Math.max(best.waitMs, rule.waitMs ?? 0);
     }
   }
 

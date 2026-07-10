@@ -10,39 +10,48 @@ const COLORS = {
   stop: 0xe74c3c,    // red     (runaway / hard stop)
 };
 
+// Discord rejects the whole webhook call when any embed field exceeds its
+// length limit, so clip everything (title 256, description 4096, value 1024).
+const trunc = (v, n) => String(v ?? "—").slice(0, n) || "—";
+
 export async function send(payload, env) {
   const url = env.DISCORD_WEBHOOK_URL;
   if (!url) {
-    console.error("DISCORD_WEBHOOK_URL not set; skipping notification");
-    return;
+    // Throw so notifier/index.js counts this as a delivery failure instead
+    // of silently dropping the alert.
+    throw new Error("DISCORD_WEBHOOK_URL not set");
   }
 
   const color = COLORS[payload.level] ?? COLORS.info;
 
   const fields = [
-    { name: "Agent", value: String(payload.agentId ?? "—"), inline: true },
-    { name: "Verdict", value: String(payload.verdict ?? "—"), inline: true },
+    { name: "Agent", value: trunc(payload.agentId, 1024), inline: true },
+    { name: "Verdict", value: trunc(payload.verdict, 1024), inline: true },
   ];
   if (payload.action) {
-    fields.push({ name: "Action", value: String(payload.action), inline: true });
+    fields.push({ name: "Action", value: trunc(payload.action, 1024), inline: true });
   }
   if (payload.approvalId) {
     fields.push({
       name: "Approval ID",
-      value: `\`${payload.approvalId}\``,
+      value: `\`${trunc(payload.approvalId, 100)}\``,
       inline: false,
     });
   }
-  if (Array.isArray(payload.fields)) fields.push(...payload.fields);
+  if (Array.isArray(payload.fields)) {
+    fields.push(...payload.fields.slice(0, 20).map((f) => ({
+      name: trunc(f?.name, 256), value: trunc(f?.value, 1024), inline: !!f?.inline,
+    })));
+  }
 
   const body = {
     username: "AgentGuard",
     embeds: [
       {
-        title: payload.title ?? "AgentGuard alert",
-        description: payload.message ?? "",
+        title: trunc(payload.title ?? "AgentGuard alert", 256),
+        description: String(payload.message ?? "").slice(0, 4096),
         color,
-        fields,
+        fields: fields.slice(0, 25),
         timestamp: new Date().toISOString(),
       },
     ],

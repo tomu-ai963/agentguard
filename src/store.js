@@ -44,8 +44,11 @@ export async function setState(env, agentId, patch) {
 
 export async function appendLog(env, agentId, entry) {
   const ts = Date.now();
+  // Random suffix so two entries in the same millisecond can't overwrite
+  // each other (audit-trail integrity).
+  const key = `${K.log(agentId, ts)}:${crypto.randomUUID().slice(0, 8)}`;
   await env.GUARD_KV.put(
-    K.log(agentId, ts),
+    key,
     JSON.stringify({ ts, ...entry }),
     { expirationTtl: LOG_TTL_SECONDS }
   );
@@ -76,6 +79,8 @@ export async function getApproval(env, rid) {
 export async function resolveApproval(env, rid, status) {
   const rec = await getApproval(env, rid);
   if (!rec) return null;
+  // First decision wins; a resolved approval cannot be flipped afterwards.
+  if (rec.status !== "pending") return { ...rec, alreadyResolved: true };
   rec.status = status;
   rec.resolvedAt = Date.now();
   await env.GUARD_KV.put(K.approval(rid), JSON.stringify(rec), { expirationTtl: 3600 });
