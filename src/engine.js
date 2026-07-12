@@ -69,6 +69,30 @@ function buildFacts(ctx) {
   };
 }
 
+// #8: rule scoping. A scope pattern is boundary-aware prefix match against the
+// agentId ("{system}/{role}-{short-id}"):
+//   - a bare "{system}" (no slash) matches ids starting with "{system}/"
+//   - a "{system}/{role}" matches ids starting with "{system}/{role}-"
+// The trailing separator prevents partial-segment matches (e.g. "tomu-cli"
+// must not match "tomu-client/..." and "collect" must not match "collector-").
+function matchesScope(pattern, agentId) {
+  if (agentId === pattern) return true;
+  const sep = pattern.includes("/") ? "-" : "/";
+  return agentId.startsWith(pattern + sep);
+}
+
+// Decide whether a rule is in scope for this agent.
+//   - tier "system" rules (e.g. the manual kill switch) are NEVER scoped: they
+//     always apply to every agent, regardless of any appliesTo.
+//   - a rule with no appliesTo (or an empty one) is global (backward compatible).
+//   - otherwise the rule applies only when the agentId matches a scope pattern.
+function ruleApplies(rule, agentId) {
+  if (rule.tier === "system") return true;
+  const scope = rule.appliesTo;
+  if (!Array.isArray(scope) || scope.length === 0) return true;
+  return scope.some((pat) => matchesScope(pat, agentId));
+}
+
 function evalCondition(cond, facts) {
   if (!cond || typeof cond !== "object") return false;
 
@@ -93,10 +117,13 @@ function evalCondition(cond, facts) {
  */
 export function judge(rules, ctx) {
   const facts = buildFacts(ctx);
+  const agentId = ctx.agentId ?? "";
   const matched = [];
   let best = { verdict: "allow", rank: 0, waitMs: 0, reason: "no rule matched", notify: false };
 
   for (const rule of rules ?? []) {
+    // #8: skip rules that aren't scoped to this agent before evaluating them.
+    if (!ruleApplies(rule, agentId)) continue;
     if (!evalCondition(rule.when, facts)) continue;
     matched.push(rule);
     const rank = VERDICT_RANK[rule.verdict] ?? 0;
@@ -126,4 +153,4 @@ export function judge(rules, ctx) {
   };
 }
 
-export { VERDICT_RANK };
+export { VERDICT_RANK, matchesScope, ruleApplies };

@@ -5,6 +5,7 @@
 // #5 parallel reads + deferred side effects.
 // Run:  node test-check-handler.mjs
 import worker from "./src/index.js";
+import { makeKV, makeD1, makeExecutionCtx } from "./test-helpers.mjs";
 
 let pass = 0, fail = 0;
 function check(name, cond) {
@@ -12,29 +13,11 @@ function check(name, cond) {
   cond ? pass++ : fail++;
 }
 
-function makeKV() {
-  const map = new Map();
-  return {
-    async get(key) { return map.has(key) ? map.get(key) : null; },
-    async put(key, value) { map.set(key, value); },
-    async delete(key) { map.delete(key); },
-    _dump() { return map; },
-  };
-}
-
-function makeExecutionCtx() {
-  const pending = [];
-  return {
-    waitUntil(p) { pending.push(p); },
-    async drain() { await Promise.all(pending); pending.length = 0; },
-  };
-}
-
 const ADMIN_TOKEN = "test-admin-token";
 const AGENT_TOKEN = "test-agent-token";
 
 function makeEnv(extra = {}) {
-  return { GUARD_KV: makeKV(), ADMIN_TOKEN, AGENT_TOKEN, ...extra };
+  return { GUARD_KV: makeKV(), GUARD_DB: makeD1(), ADMIN_TOKEN, AGENT_TOKEN, ...extra };
 }
 
 function req(path, body, token = AGENT_TOKEN) {

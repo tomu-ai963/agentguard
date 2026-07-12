@@ -4,8 +4,10 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node test-engine.mjs && node test-store.mjs && node test-check-handler.mjs",
-    "dev": "wrangler dev"
+    "test": "node test-engine.mjs && node test-store.mjs && node test-check-handler.mjs && node test-notifier.mjs && node test-routing.mjs && node test-logs.mjs",
+    "dev": "wrangler dev",
+    "db:migrate:local": "wrangler d1 migrations apply GUARD_DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply GUARD_DB --remote"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

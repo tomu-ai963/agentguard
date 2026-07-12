@@ -10,6 +10,18 @@ compatibility_date = "2026-05-18"
 binding = "GUARD_KV"
 id = "0b7e9cfd921e46c19bc431374a194f30"
 
+# --- D1 database binding (#7: audit trail) ---
+# Create the remote DB once, then paste its id below:
+#   npx wrangler d1 create agentguard-audit
+# Apply the schema (local dev / CI use --local, production uses --remote):
+#   npx wrangler d1 migrations apply GUARD_DB --local
+#   npx wrangler d1 migrations apply GUARD_DB --remote
+[[d1_databases]]
+binding = "GUARD_DB"
+database_name = "agentguard-audit"
+database_id = "c11d1eea-0a7d-46df-a016-e22289c31e7a"
+migrations_dir = "migrations"
+
 # --- Plain (non-secret) vars ---
 [vars]
 ENV_NAME = "dev"

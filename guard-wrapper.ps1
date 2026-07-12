@@ -5,11 +5,31 @@
 #   Invoke-Guarded "wrangler deploy"
 
 $GUARD_URL       = "https://agentguard.inverted-triangle-leef.workers.dev"
-$AGENT_ID        = "claude-code-local"
+$AGENT_SYSTEM    = "claude-code"   # one of: claude-code, tomu-agent, tomu-cli
 $AGENT_TOKEN     = $env:AGENTGUARD_AGENT_TOKEN
 $POLL_INTERVAL   = 5    # seconds
 $POLL_TIMEOUT    = 300  # seconds — long enough for a human to notice the ping
 $HEARTBEAT_EVERY = 30   # seconds between background heartbeats
+
+# agentId format (#9): "{system}/{role}-{short-id}", e.g.
+#   "claude-code/design-review-a3f9"
+# Generating the id is the caller's responsibility; this wrapper builds a
+# sensible default so it works standalone. Override the whole id via
+# $env:AGENTGUARD_AGENT_ID, or just the task purpose via $env:AGENTGUARD_ROLE.
+# (Intercept happens here in a shell wrapper today; moving it into a shared MCP
+#  middleware is out of scope and tracked for the future integrated-MCP server.)
+function New-GuardAgentId {
+    if ($env:AGENTGUARD_AGENT_ID) { return $env:AGENTGUARD_AGENT_ID }
+    $role = if ($env:AGENTGUARD_ROLE) { $env:AGENTGUARD_ROLE } else { "local" }
+    # role is a self-declared short task purpose, sanitized to [a-z0-9-].
+    $role = ($role.ToLower() -replace '[^a-z0-9-]', '-').Trim('-')
+    if (-not $role) { $role = "local" }
+    # 4-char random short-id to avoid collisions between concurrent sessions.
+    $chars = '0123456789abcdefghijklmnopqrstuvwxyz'.ToCharArray()
+    $shortId = -join (1..4 | ForEach-Object { $chars | Get-Random })
+    return "$AGENT_SYSTEM/$role-$shortId"
+}
+$AGENT_ID = New-GuardAgentId
 
 if (-not $AGENT_TOKEN) {
     Write-Warning "[AgentGuard] AGENTGUARD_AGENT_TOKEN is not set — guarded commands will be BLOCKED (the guard now requires auth)."

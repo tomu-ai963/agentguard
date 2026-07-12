@@ -6,6 +6,9 @@ export const DEFAULT_RULES = [
   {
     id: "manual-killswitch",
     type: "policy",
+    // #8: system-tier — the emergency kill switch must apply to every agent
+    // and can never be narrowed by a rule's appliesTo scope.
+    tier: "system",
     // The /check handler injects metrics.killswitch=1 when the flag is set in KV.
     when: { metric: "killswitch", op: "==", value: 1 },
     verdict: "stop",

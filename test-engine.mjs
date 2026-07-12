@@ -1,6 +1,6 @@
 // test-engine.mjs — verify all four verdicts without any network/KV,
 // plus the validation layer. Run:  node test-engine.mjs
-import { judge } from "./src/engine.js";
+import { judge, matchesScope } from "./src/engine.js";
 import { DEFAULT_RULES } from "./src/rules.default.js";
 import {
   validAgentId, sanitizeMetrics, sanitizeLogEntry, validateRules,
@@ -48,6 +48,59 @@ assert("agentId: normal id ok", validAgentId("claude-code-local"));
 assert("agentId: path traversal rejected", !validAgentId("../rules:global"));
 assert("agentId: colon rejected (KV key safety)", !validAgentId("a:b"));
 assert("agentId: non-string rejected", !validAgentId({ a: 1 }));
+
+// --- #9: {system}/{role}-{short-id} agentId format ---
+assert("agentId: structured id ok", validAgentId("claude-code/design-review-a3f9"));
+assert("agentId: tomu-cli system ok", validAgentId("tomu-cli/collect-9zab"));
+assert("agentId: unknown system rejected", !validAgentId("evil-system/x-1"));
+assert("agentId: two slashes rejected", !validAgentId("claude-code/design/review"));
+assert("agentId: slash traversal rejected", !validAgentId("claude-code/../rules"));
+assert("agentId: leading slash rejected", !validAgentId("/claude-code"));
+
+// --- #8: appliesTo rule scoping ---
+const scopedStop = (id, appliesTo, tier) => [{
+  id, tier, appliesTo, verdict: "stop",
+  when: { metric: "loopCount", op: ">=", value: 1 },
+}];
+const trip = { metrics: { loopCount: 5 } };
+
+assert("scope: unscoped rule applies to any agentId",
+  judge(scopedStop("r"), { agentId: "tomu-cli/collect-a1b2", ...trip }).verdict === "stop");
+assert("scope: system-level prefix matches that system",
+  judge(scopedStop("r", ["tomu-cli"]), { agentId: "tomu-cli/collect-a1b2", ...trip }).verdict === "stop");
+assert("scope: system-level prefix does not match other systems",
+  judge(scopedStop("r", ["tomu-cli"]), { agentId: "claude-code/x-a1b2", ...trip }).verdict === "allow");
+assert("scope: system-level prefix is boundary-aware (no partial segment)",
+  judge(scopedStop("r", ["tomu-cli"]), { agentId: "tomu-client/x-a1b2", ...trip }).verdict === "allow");
+assert("scope: system/role prefix matches that role",
+  judge(scopedStop("r", ["tomu-cli/collect"]), { agentId: "tomu-cli/collect-a1b2", ...trip }).verdict === "stop");
+assert("scope: system/role prefix is boundary-aware (collect != collector)",
+  judge(scopedStop("r", ["tomu-cli/collect"]), { agentId: "tomu-cli/collector-a1b2", ...trip }).verdict === "allow");
+assert("scope: non-matching agentId does not evaluate the rule",
+  judge(scopedStop("r", ["tomu-cli"]), { agentId: "tomu-cli/collect-a1b2", ...trip }).matched.length === 1 &&
+  judge(scopedStop("r", ["tomu-cli"]), { agentId: "claude-code/x-a1b2", ...trip }).matched.length === 0);
+assert("scope: system-tier rule ignores appliesTo (always applies)",
+  judge(scopedStop("r", ["tomu-cli"], "system"), { agentId: "claude-code/x-a1b2", ...trip }).verdict === "stop");
+assert("scope: manual-killswitch (system tier) fires for a scoped-out agent",
+  judge(DEFAULT_RULES, { agentId: "claude-code/x-a1b2", metrics: { killswitch: 1 } }).verdict === "stop");
+
+// matchesScope unit checks
+assert("matchesScope: bare system needs '/' boundary", matchesScope("tomu-cli", "tomu-cli/x-1"));
+assert("matchesScope: bare system rejects partial segment", !matchesScope("tomu-cli", "tomu-client/x-1"));
+assert("matchesScope: system/role needs '-' boundary", matchesScope("tomu-cli/collect", "tomu-cli/collect-1"));
+assert("matchesScope: exact match", matchesScope("tomu-cli/collect-1", "tomu-cli/collect-1"));
+
+// appliesTo / tier validation
+assert("rules: valid appliesTo accepted",
+  validateRules([{ id: "s", verdict: "stop", appliesTo: ["tomu-cli", "claude-code/x"], when: { metric: "loopCount", op: ">", value: 1 } }]) === null);
+assert("rules: appliesTo non-array rejected",
+  validateRules([{ id: "s", verdict: "stop", appliesTo: "tomu-cli", when: { metric: "loopCount", op: ">", value: 1 } }]) !== null);
+assert("rules: bad appliesTo pattern rejected",
+  validateRules([{ id: "s", verdict: "stop", appliesTo: ["a:b"], when: { metric: "loopCount", op: ">", value: 1 } }]) !== null);
+assert("rules: unknown tier rejected",
+  validateRules([{ id: "s", verdict: "stop", tier: "root", when: { metric: "loopCount", op: ">", value: 1 } }]) !== null);
+assert("rules: tier system accepted",
+  validateRules([{ id: "s", verdict: "stop", tier: "system", when: { metric: "loopCount", op: ">", value: 1 } }]) === null);
 
 const m = sanitizeMetrics({ costUSD: 1.5, lastHeartbeat: 9999, status: "alive", tokensUsed: -5, loopCount: "3" });
 assert("metrics: known numeric kept", m.costUSD === 1.5 && m.loopCount === 3);

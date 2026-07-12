@@ -10,6 +10,7 @@
 //   POST /approval/:rid    resolve an approval { status: "approved"|"denied" }   [admin]
 //   GET  /rules            list rules                                            [agent]
 //   POST /rules            replace rules                                         [admin]
+//   GET  /logs             read the D1 audit trail (?agentId=&eventType=&limit=) [admin]
 //
 // Auth: every route except GET / requires
 //   Authorization: Bearer <AGENT_TOKEN | ADMIN_TOKEN>
@@ -28,7 +29,7 @@ import {
   sanitizeMetrics, sanitizeLogEntry, validateRules, MAX_BODY_BYTES,
 } from "./validate.js";
 import {
-  getRules, setRules, getState, setState, appendLog,
+  getRules, setRules, getState, setState, appendLog, queryLogs,
   isKillswitchActive, setKillswitch,
   createApproval, getApproval, resolveApproval,
   incrementCheckCounters, shouldNotify,
@@ -69,6 +70,7 @@ async function notifyAndAudit(env, agentId, payload) {
   const res = await notify(payload, env);
   if (res.failed.length) {
     await appendLog(env, agentId, {
+      eventType: "notify_failed",
       action: "notify_failed",
       verdict: payload.verdict,
       reason: `notification failed on: ${res.failed.join(", ")}`,
@@ -93,7 +95,9 @@ export default {
         (method === "POST" && (pathname === "/rules" ||
           pathname.startsWith("/killswitch/") ||
           pathname.startsWith("/approval/") ||
-          pathname.startsWith("/reset/")));
+          pathname.startsWith("/reset/"))) ||
+        // The audit trail is sensitive: reading it is admin-only.
+        (method === "GET" && pathname === "/logs");
       const auth = await authorize(req, env, isAdminRoute ? "admin" : "agent");
       if (!auth.ok) return json({ error: auth.error }, auth.status);
 
@@ -101,7 +105,7 @@ export default {
       if (method === "POST" && pathname === "/check") {
         const ctx = await readJson(req);
         if (!validAgentId(ctx.agentId)) {
-          return json({ error: "agentId must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}" }, 400);
+          return json({ error: "agentId must be a flat id or a '{system}/{role}-{short-id}' with a known system" }, 400);
         }
         const agentId = ctx.agentId;
         const action = cleanString(ctx.action, 256);
@@ -166,6 +170,7 @@ export default {
         );
         deferred(executionCtx, () =>
           appendLog(env, agentId, {
+            eventType: "check",
             action, tool,
             verdict: result.verdict, reason: result.reason, ruleId: result.ruleId,
             source: "guard",
@@ -228,7 +233,11 @@ export default {
         const body = await readJson(req);
         if (!validAgentId(body.agentId)) return json({ error: "invalid agentId" }, 400);
         const entry = sanitizeLogEntry(body);
-        await appendLog(env, body.agentId, { ...entry, source: "agent" });
+        // #7: audit write is deferred (waitUntil) so a slow D1 never blocks.
+        deferred(executionCtx, () =>
+          appendLog(env, body.agentId, { eventType: "agent_log", ...entry, source: "agent" })
+            .catch((err) => console.error("appendLog failed:", err))
+        );
         return json({ ok: true });
       }
 
@@ -246,10 +255,12 @@ export default {
         const next = await setState(env, agentId, {
           tokensUsed: 0, costUSD: 0, loopCount: 0,
         });
-        await appendLog(env, agentId, {
-          action: "counters_reset", verdict: "allow",
-          reason: "spend/loop counters reset by admin", source: "admin",
-        });
+        deferred(executionCtx, () =>
+          appendLog(env, agentId, {
+            eventType: "reset", action: "counters_reset", verdict: "allow",
+            reason: "spend/loop counters reset by admin", source: "admin",
+          }).catch((err) => console.error("appendLog failed:", err))
+        );
         return json({ ok: true, state: next });
       }
 
@@ -259,16 +270,20 @@ export default {
         if (!validAgentId(agentId)) return json({ error: "invalid agentId" }, 400);
         const { active } = await readJson(req);
         await setKillswitch(env, agentId, !!active);
-        await appendLog(env, agentId, {
-          action: "killswitch", verdict: active ? "stop" : "allow",
-          reason: `manual kill switch ${active ? "engaged" : "released"}`, source: "admin",
-        });
-        await notifyAndAudit(env, agentId, {
-          level: active ? "stop" : "info",
-          title: `AgentGuard: kill switch ${active ? "ENGAGED" : "released"}`,
-          message: `Manual kill switch ${active ? "engaged" : "released"} for ${agentId}`,
-          agentId, verdict: active ? "stop" : "allow",
-        });
+        deferred(executionCtx, () =>
+          appendLog(env, agentId, {
+            eventType: "killswitch", action: "killswitch", verdict: active ? "stop" : "allow",
+            reason: `manual kill switch ${active ? "engaged" : "released"}`, source: "admin",
+          }).catch((err) => console.error("appendLog failed:", err))
+        );
+        deferred(executionCtx, () =>
+          notifyAndAudit(env, agentId, {
+            level: active ? "stop" : "info",
+            title: `AgentGuard: kill switch ${active ? "ENGAGED" : "released"}`,
+            message: `Manual kill switch ${active ? "engaged" : "released"} for ${agentId}`,
+            agentId, verdict: active ? "stop" : "allow",
+          }).catch((err) => console.error("notify dispatch failed:", err))
+        );
         return json({ ok: true, agentId, killswitch: !!active });
       }
 
@@ -294,10 +309,13 @@ export default {
         if (rec.alreadyResolved) {
           return json({ error: `already ${rec.status}`, approval: rec }, 409);
         }
-        await appendLog(env, rec.agentId ?? "system", {
-          action: "approval_resolved", verdict: status === "approved" ? "allow" : "stop",
-          reason: `approval ${rid} ${status}`, ruleId: rec.ruleId, source: "admin",
-        });
+        deferred(executionCtx, () =>
+          appendLog(env, rec.agentId ?? "system", {
+            eventType: "approval", action: "approval_resolved",
+            verdict: status === "approved" ? "allow" : "stop",
+            reason: `approval ${rid} ${status}`, ruleId: rec.ruleId, source: "admin",
+          }).catch((err) => console.error("appendLog failed:", err))
+        );
         return json({ ok: true, approval: rec });
       }
 
@@ -306,16 +324,34 @@ export default {
         return json(await getRules(env));
       }
 
+      // ---- GET /logs (admin) : read the D1 audit trail ----
+      if (method === "GET" && pathname === "/logs") {
+        const agentId = url.searchParams.get("agentId") || undefined;
+        if (agentId && !validAgentId(agentId)) return json({ error: "invalid agentId" }, 400);
+        const eventTypeRaw = url.searchParams.get("eventType") || undefined;
+        if (eventTypeRaw && !/^[a-z_]{1,32}$/.test(eventTypeRaw)) {
+          return json({ error: "invalid eventType" }, 400);
+        }
+        const limit = Number(url.searchParams.get("limit"));
+        const logs = await queryLogs(env, {
+          agentId, eventType: eventTypeRaw,
+          limit: Number.isFinite(limit) && limit > 0 ? limit : 100,
+        });
+        return json({ logs, count: logs.length });
+      }
+
       // ---- POST /rules (admin) ----
       if (method === "POST" && pathname === "/rules") {
         const rules = await readJson(req);
         const err = validateRules(rules);
         if (err) return json({ error: err }, 400);
         await setRules(env, rules);
-        await appendLog(env, "system", {
-          action: "rules_update", verdict: "allow",
-          reason: `rule set replaced (${rules.length} rules)`, source: "admin",
-        });
+        deferred(executionCtx, () =>
+          appendLog(env, "system", {
+            eventType: "rule_change", action: "rules_update", verdict: "allow",
+            reason: `rule set replaced (${rules.length} rules)`, source: "admin",
+          }).catch((err) => console.error("appendLog failed:", err))
+        );
         return json({ ok: true, count: rules.length });
       }
 

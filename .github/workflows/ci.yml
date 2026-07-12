@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Runs every suite via the package.json "test" script:
+      #   engine + validation, store, /check handler, notifier adapters,
+      #   routing/error handling, and the #7 D1 audit trail (write + read).
+      # Each runner exits non-zero on failure, so a red suite fails the job.
+      - name: Run tests
+        run: npm test
