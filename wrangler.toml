@@ -24,7 +24,6 @@ migrations_dir = "migrations"
 
 # --- Plain (non-secret) vars ---
 [vars]
-ENV_NAME = "dev"
 # Comma-separated notification channels; "slack" additionally needs the
 # SLACK_WEBHOOK_URL secret.
 NOTIFY_CHANNELS = "discord"
